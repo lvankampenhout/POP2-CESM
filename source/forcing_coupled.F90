@@ -12,7 +12,7 @@
 !  be specified during the make process.
 !
 ! !REVISION HISTORY:
-!  SVN:$Id: forcing_coupled.F90 26603 2011-01-28 23:09:02Z njn01 $
+!  SVN:$Id$
 !
 ! !USES:
  
@@ -51,6 +51,11 @@
    use named_field_mod, only: named_field_register, named_field_get_index, &
        named_field_set, named_field_get
    use forcing_fields
+   use estuary_vsf_mod, only: lestuary_on, lvsf_river, lebm_on
+   use estuary_vsf_mod, only: MASK_ESTUARY, vsf_river_correction
+   use estuary_vsf_mod, only: set_estuary_vsf_forcing, set_estuary_exch_circ
+   use mcog, only: tavg_mcog
+   use mcog, only: FRAC_BIN, QSW_RAW_BIN
       
    implicit none
    save
@@ -329,10 +334,13 @@
 
      if ( (qsw_distrb_iopt == qsw_distrb_iopt_12hr) .or. &
            (qsw_distrb_iopt == qsw_distrb_iopt_cosz) ) then
-        if ( tmix_iopt /= tmix_avgfit )  &
+        if ( tmix_iopt == tmix_avgfit .or. tmix_iopt == tmix_robert)  then
+          ! ok; these options are supported
+        else
           call exit_POP(sigAbort,   &
                'ERROR: time_mix_opt must be set to avgfit for qsw_distrb_opt '/&
             &/ 'of 12hr or cosz')
+        endif
 
         if ( dttxcel(1) /= c1  .or.  dtuxcel /= c1 )   &
           call exit_POP(sigAbort,   &
@@ -796,17 +804,38 @@
 !  if not a variable thickness surface layer or if fw_as_salt_flx
 !  flag is on, convert fresh and salt inputs to a virtual salinity flux
 !
+!  Add ROFF_F to STF(:,:,2) where the ebm is not handling it
+!
 !-----------------------------------------------------------------------
 
       !$OMP PARALLEL DO PRIVATE(iblock)
       do iblock = 1, nblocks_clinic
         STF(:,:,2,iblock) = RCALCT(:,:,iblock)*(  &
                      (PREC_F(:,:,iblock)+EVAP_F(:,:,iblock)+  &
-                      MELT_F(:,:,iblock)+ROFF_F(:,:,iblock)+IOFF_F(:,:,iblock))*salinity_factor   &
-                    + SALT_F(:,:,iblock)*sflux_factor)  
+                      MELT_F(:,:,iblock)+(c1-MASK_ESTUARY(:,:,iblock))*ROFF_F(:,:,iblock)+&
+                      IOFF_F(:,:,iblock))*salinity_factor   &
+                    + SALT_F(:,:,iblock)*sflux_factor)
       enddo
       !$OMP END PARALLEL DO
  
+      if ( lestuary_on ) then
+!  Treat river runoff as the interior source
+        if (lvsf_river) call set_estuary_vsf_forcing
+!  Include estuary exchange flow as vertical salt flux
+        if (lebm_on)    call set_estuary_exch_circ
+
+        if (lvsf_river) THEN
+!  Add global correction for salt conservation, correcting for using local
+!  tracer concentration in application of ROFF_F. Analogous term for passive
+!  tracers is applied in passive_tracers.F90:set_sflux_passive_tracers,
+!  after STF has been computed. Correction is applied where MASK_ESTUARY=1.
+          !$OMP PARALLEL DO PRIVATE(iblock)
+          do iblock = 1, nblocks_clinic
+            STF(:,:,2,iblock) = STF(:,:,2,iblock) + MASK_ESTUARY(:,:,iblock)*vsf_river_correction(2)
+          enddo
+          !$OMP END PARALLEL DO
+        endif
+      endif
 !-----------------------------------------------------------------------
 !
 !  balance salt/freshwater in marginal seas
@@ -1095,6 +1124,8 @@
 
    !$OMP END PARALLEL DO
 
+   call tavg_mcog
+
 #endif
 
 !-----------------------------------------------------------------------
@@ -1293,6 +1324,117 @@
    if (errorCode /= POP_Success) then
       call POP_ErrorSet(errorCode, &
          'update_ghost_cells_coupler: error updating U10_SQR')
+      return
+   endif
+
+! QL, 150526, LAMULT, USTOKES and VSTOKES
+   call POP_HaloUpdate(LAMULT,POP_haloClinic,         &
+                       POP_gridHorzLocCenter,          &
+                       POP_fieldKindScalar, errorCode, &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating LAMULT')
+      return
+   endif
+
+   call POP_HaloUpdate(USTOKES,POP_haloClinic,         &
+                       POP_gridHorzLocCenter,          &
+                       POP_fieldKindScalar, errorCode, &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating USTOKES')
+      return
+   endif
+
+   call POP_HaloUpdate(VSTOKES,POP_haloClinic,         &
+                       POP_gridHorzLocCenter,          &
+                       POP_fieldKindScalar, errorCode, &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating VSTOKES')
+      return
+   endif
+
+   call POP_HaloUpdate(ATM_FINE_DUST_FLUX,POP_haloClinic, &
+                       POP_gridHorzLocCenter,             &
+                       POP_fieldKindScalar, errorCode,    &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating ATM_FINE_DUST_FLUX')
+      return
+   endif
+
+   call POP_HaloUpdate(ATM_COARSE_DUST_FLUX,POP_haloClinic, &
+                       POP_gridHorzLocCenter,               &
+                       POP_fieldKindScalar, errorCode,      &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating ATM_COARSE_DUST_FLUX')
+      return
+   endif
+
+   call POP_HaloUpdate(SEAICE_DUST_FLUX,POP_haloClinic, &
+                       POP_gridHorzLocCenter,           &
+                       POP_fieldKindScalar, errorCode,  &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating SEAICE_DUST_FLUX')
+      return
+   endif
+
+   call POP_HaloUpdate(ATM_BLACK_CARBON_FLUX,POP_haloClinic, &
+                       POP_gridHorzLocCenter,                &
+                       POP_fieldKindScalar, errorCode,       &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating ATM_BLACK_CARBON_FLUX')
+      return
+   endif
+
+   call POP_HaloUpdate(SEAICE_BLACK_CARBON_FLUX,POP_haloClinic, &
+                       POP_gridHorzLocCenter,                   &
+                       POP_fieldKindScalar, errorCode,          &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating SEAICE_BLACK_CARBON_FLUX')
+      return
+   endif
+
+   call POP_HaloUpdate(FRAC_BIN,POP_haloClinic,        &
+                       POP_gridHorzLocCenter,          &
+                       POP_fieldKindScalar, errorCode, &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating FRAC_BIN')
+      return
+   endif
+
+   call POP_HaloUpdate(QSW_RAW_BIN,POP_haloClinic,     &
+                       POP_gridHorzLocCenter,          &
+                       POP_fieldKindScalar, errorCode, &
+                       fillValue = 0.0_POP_r8)
+
+   if (errorCode /= POP_Success) then
+      call POP_ErrorSet(errorCode, &
+         'update_ghost_cells_coupler: error updating QSW_RAW_BIN')
       return
    endif
 
